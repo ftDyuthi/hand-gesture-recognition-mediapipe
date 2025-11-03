@@ -39,6 +39,7 @@ def get_args():
 
 def main():
     # Argument parsing #################################################################
+    # Argument parsing #################################################################
     args = get_args()
 
     cap_device = args.device
@@ -51,6 +52,7 @@ def main():
 
     use_brect = True
 
+    # Camera preparation ###############################################################
     # Camera preparation ###############################################################
     cap = cv.VideoCapture(cap_device)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
@@ -234,6 +236,7 @@ def pre_process_point_history(image, point_history):
     temp_point_history = copy.deepcopy(point_history)
 
     # Convert to relative coordinates
+    # Convert to relative coordinates
     base_x, base_y = 0, 0
     for index, point in enumerate(temp_point_history):
         if index == 0:
@@ -244,6 +247,7 @@ def pre_process_point_history(image, point_history):
         temp_point_history[index][1] = (temp_point_history[index][1] -
                                         base_y) / image_height
 
+    # Convert to a one-dimensional list
     # Convert to a one-dimensional list
     temp_point_history = list(
         itertools.chain.from_iterable(temp_point_history))
@@ -367,6 +371,7 @@ def draw_landmarks(image, landmark_point):
 
 def draw_bounding_rect(use_brect, image, brect):
     if use_brect:
+        # Outer rectangle
         # Outer rectangle
         cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[3]),
                      (0, 0, 0), 1)

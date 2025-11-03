@@ -12,8 +12,7 @@ import numpy as np
 import mediapipe as mp
 
 from utils import CvFpsCalc
-from model import KeyPointClassifier
-from model import PointHistoryClassifier
+from model import KeyPointSequenceClassifier
 
 
 def get_args():
@@ -39,7 +38,7 @@ def get_args():
 
 
 def main():
-    # 引数解析 #################################################################
+    # Argument parsing #################################################################
     args = get_args()
 
     cap_device = args.device
@@ -52,48 +51,33 @@ def main():
 
     use_brect = True
 
-    # カメラ準備 ###############################################################
+    # Camera preparation ###############################################################
     cap = cv.VideoCapture(cap_device)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
 
-    # モデルロード #############################################################
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
+    # Model load #############################################################
+    # Use Holistic (gives hands + pose + face) but we only use hand landmarks here
+    mp_holistic = mp.solutions.holistic
+    holistic = mp_holistic.Holistic(
         static_image_mode=use_static_image_mode,
-        max_num_hands=1,
+        model_complexity=1,
         min_detection_confidence=min_detection_confidence,
         min_tracking_confidence=min_tracking_confidence,
     )
 
-    keypoint_classifier = KeyPointClassifier()
+    # Only the sequence classifier is used for this workflow
+    keypoint_sequence_classifier = KeyPointSequenceClassifier()
 
-    point_history_classifier = PointHistoryClassifier()
-
-    # Read labels ###########################################################
-    with open('model/keypoint_classifier/keypoint_classifier_label.csv',
-              encoding='utf-8-sig') as f:
-        keypoint_classifier_labels = csv.reader(f)
-        keypoint_classifier_labels = [
-            row[0] for row in keypoint_classifier_labels
-        ]
-    with open(
-            'model/point_history_classifier/point_history_classifier_label.csv',
-            encoding='utf-8-sig') as f:
-        point_history_classifier_labels = csv.reader(f)
-        point_history_classifier_labels = [
-            row[0] for row in point_history_classifier_labels
-        ]
+    # (no label CSVs used here — we'll display sequence-class ids directly)
 
     # FPS Measurement ########################################################
     cvFpsCalc = CvFpsCalc(buffer_len=10)
 
-    # Coordinate history #################################################################
-    history_length = 16
-    point_history = deque(maxlen=history_length)
-
-    # Finger gesture history ################################################
-    finger_gesture_history = deque(maxlen=history_length)
+    # Coordinate / keypoint history
+    history_length = 30
+    # Store per-frame pre-processed landmark vectors (shape D)
+    keypoint_history = deque(maxlen=history_length)
 
     #  ########################################################################
     mode = 0
@@ -118,60 +102,49 @@ def main():
         image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
 
         image.flags.writeable = False
-        results = hands.process(image)
+        results = holistic.process(image)
         image.flags.writeable = True
 
-        #  ####################################################################
-        if results.multi_hand_landmarks is not None:
-            for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
-                                                  results.multi_handedness):
-                # Bounding box calculation
-                brect = calc_bounding_rect(debug_image, hand_landmarks)
-                # ランドマークの計算
-                landmark_list = calc_landmark_list(debug_image, hand_landmarks)
+        # Holistic provides left/right hand landmarks as separate attributes
+        hand_landmarks = None
+        if results.right_hand_landmarks:
+            hand_landmarks = results.right_hand_landmarks
+        elif results.left_hand_landmarks:
+            hand_landmarks = results.left_hand_landmarks
 
-                # Conversion to relative coordinates / normalized coordinates
-                pre_processed_landmark_list = pre_process_landmark(
-                    landmark_list)
-                pre_processed_point_history_list = pre_process_point_history(
-                    debug_image, point_history)
-                # Write to the dataset file
-                logging_csv(number, mode, pre_processed_landmark_list,
-                            pre_processed_point_history_list)
+        seq_pred = None
 
-                # Hand sign classification
-                hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
-                if hand_sign_id == 2:  # 指差しサイン
-                    point_history.append(landmark_list[8])  # 人差指座標
-                else:
-                    point_history.append([0, 0])
-
-                # Finger gesture classification
-                finger_gesture_id = 0
-                point_history_len = len(pre_processed_point_history_list)
-                if point_history_len == (history_length * 2):
-                    finger_gesture_id = point_history_classifier(
-                        pre_processed_point_history_list)
-
-                # 直近検出の中で最多のジェスチャーIDを算出
-                finger_gesture_history.append(finger_gesture_id)
-                most_common_fg_id = Counter(
-                    finger_gesture_history).most_common()
-
-                # Drawing part
-                debug_image = draw_bounding_rect(use_brect, debug_image, brect)
-                debug_image = draw_landmarks(debug_image, landmark_list)
-                debug_image = draw_info_text(
-                    debug_image,
-                    brect,
-                    handedness,
-                    keypoint_classifier_labels[hand_sign_id],
-                    point_history_classifier_labels[most_common_fg_id[0][0]],
-                )
+        # Bounding box and landmarks (only if hand detected)
+        if hand_landmarks is not None:
+            brect = calc_bounding_rect(debug_image, hand_landmarks)
+            landmark_list = calc_landmark_list(debug_image, hand_landmarks)
         else:
-            point_history.append([0, 0])
+            brect = [0, 0, 0, 0]
+            landmark_list = []
 
-        debug_image = draw_point_history(debug_image, point_history)
+        # Build per-frame feature vector (hands + upper-pose) and append to sequence buffer
+        frame_features = extract_frame_landmarks(results)
+        keypoint_history.append(frame_features)
+
+        # If buffer is full, call the sequence classifier
+        if len(keypoint_history) == history_length:
+            try:
+                seq_pred = keypoint_sequence_classifier(list(keypoint_history))
+            except Exception as e:
+                print(f"Sequence classifier error: {e}")
+
+        # Drawing part
+        debug_image = draw_bounding_rect(use_brect, debug_image, brect)
+        debug_image = draw_landmarks(debug_image, landmark_list)
+
+        # Display sequence prediction (if available)
+        if seq_pred is not None:
+            cv.putText(debug_image, f"SEQ:{seq_pred}", (10, 60),
+                       cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv.LINE_AA)
+            cv.putText(debug_image, f"SEQ:{seq_pred}", (10, 60),
+                       cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2,
+                       cv.LINE_AA)
+
         debug_image = draw_info(debug_image, fps, mode, number)
 
         # Screen reflection #############################################################
@@ -260,7 +233,7 @@ def pre_process_point_history(image, point_history):
 
     temp_point_history = copy.deepcopy(point_history)
 
-    # 相対座標に変換
+    # Convert to relative coordinates
     base_x, base_y = 0, 0
     for index, point in enumerate(temp_point_history):
         if index == 0:
@@ -271,11 +244,61 @@ def pre_process_point_history(image, point_history):
         temp_point_history[index][1] = (temp_point_history[index][1] -
                                         base_y) / image_height
 
-    # 1次元リストに変換
+    # Convert to a one-dimensional list
     temp_point_history = list(
         itertools.chain.from_iterable(temp_point_history))
 
     return temp_point_history
+
+
+def extract_frame_landmarks(results):
+    """
+    Build a per-frame feature vector from Holistic results.
+    Format to match training model (477 features):
+      - left hand: 21 landmarks × 3 = 63
+      - right hand: 21 landmarks × 3 = 63
+      - pose: ALL 33 landmarks × 3 = 99
+      - face: 84 landmarks × 3 = 252
+    Total: 63 + 63 + 99 + 252 = 477
+    """
+    frame_landmarks = []
+
+    # Left hand (21 * 3 = 63)
+    if results.left_hand_landmarks:
+        for lm in results.left_hand_landmarks.landmark:
+            frame_landmarks.extend([lm.x, lm.y, lm.z])
+    else:
+        frame_landmarks.extend([0.0] * 63)
+
+    # Right hand (21 * 3 = 63)
+    if results.right_hand_landmarks:
+        for lm in results.right_hand_landmarks.landmark:
+            frame_landmarks.extend([lm.x, lm.y, lm.z])
+    else:
+        frame_landmarks.extend([0.0] * 63)
+
+    # Pose - ALL 33 landmarks (33 * 3 = 99)
+    if results.pose_landmarks:
+        for i in range(33):  # CHANGED from range(11)
+            lm = results.pose_landmarks.landmark[i]
+            frame_landmarks.extend([lm.x, lm.y, lm.z])
+    else:
+        frame_landmarks.extend([0.0] * 99)  # CHANGED from 33
+
+    # Face landmarks - first 84 landmarks (84 * 3 = 252)
+    if results.face_landmarks:
+        # MediaPipe face mesh has 468 landmarks, we use first 84
+        for i in range(min(84, len(results.face_landmarks.landmark))):
+            lm = results.face_landmarks.landmark[i]
+            frame_landmarks.extend([lm.x, lm.y, lm.z])
+    else:
+        frame_landmarks.extend([0.0] * 252)
+
+    # Verify we have exactly 477 features
+    if len(frame_landmarks) != 477:
+        print(f"WARNING: Expected 477 features, got {len(frame_landmarks)}")
+    
+    return frame_landmarks
 
 
 def logging_csv(number, mode, landmark_list, point_history_list):
@@ -295,197 +318,56 @@ def logging_csv(number, mode, landmark_list, point_history_list):
 
 
 def draw_landmarks(image, landmark_point):
-    # 接続線
-    if len(landmark_point) > 0:
-        # 親指
-        cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[3]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[3]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[3]), tuple(landmark_point[4]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[3]), tuple(landmark_point[4]),
-                (255, 255, 255), 2)
+    # Accept either a mediapipe landmarks object (has .landmark) or
+    # a list of (x, y) tuples / lists in image coordinates.
+    if not landmark_point:
+        return image
 
-        # 人差指
-        cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[6]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[6]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[6]), tuple(landmark_point[7]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[6]), tuple(landmark_point[7]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[7]), tuple(landmark_point[8]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[7]), tuple(landmark_point[8]),
-                (255, 255, 255), 2)
+    img_h, img_w = image.shape[0], image.shape[1]
 
-        # 中指
-        cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[10]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[10]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[10]), tuple(landmark_point[11]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[10]), tuple(landmark_point[11]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[11]), tuple(landmark_point[12]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[11]), tuple(landmark_point[12]),
-                (255, 255, 255), 2)
+    # Build a list of (x, y) pixel coordinates
+    points = []
+    if hasattr(landmark_point, 'landmark'):
+        # mediapipe LandmarkList
+        for lm in landmark_point.landmark:
+            x = min(int(lm.x * img_w), img_w - 1)
+            y = min(int(lm.y * img_h), img_h - 1)
+            points.append((x, y))
+    else:
+        # assume list-like of [x, y]
+        for p in landmark_point:
+            try:
+                points.append((int(p[0]), int(p[1])))
+            except Exception:
+                # skip malformed entries
+                continue
 
-        # 薬指
-        cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[14]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[14]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[14]), tuple(landmark_point[15]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[14]), tuple(landmark_point[15]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[15]), tuple(landmark_point[16]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[15]), tuple(landmark_point[16]),
-                (255, 255, 255), 2)
+    # Use MediaPipe's hand connections for drawing skeleton lines if available
+    try:
+        connections = mp.solutions.hands.HAND_CONNECTIONS
+    except Exception:
+        connections = []
 
-        # 小指
-        cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[18]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[18]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[18]), tuple(landmark_point[19]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[18]), tuple(landmark_point[19]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[19]), tuple(landmark_point[20]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[19]), tuple(landmark_point[20]),
-                (255, 255, 255), 2)
+    # Draw connections (black thick, then white thin for a bordered look)
+    for c in connections:
+        start_idx, end_idx = c
+        if start_idx < len(points) and end_idx < len(points):
+            cv.line(image, points[start_idx], points[end_idx], (0, 0, 0), 6)
+            cv.line(image, points[start_idx], points[end_idx], (255, 255, 255), 2)
 
-        # 手の平
-        cv.line(image, tuple(landmark_point[0]), tuple(landmark_point[1]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[0]), tuple(landmark_point[1]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[1]), tuple(landmark_point[2]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[1]), tuple(landmark_point[2]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[5]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[2]), tuple(landmark_point[5]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[9]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[5]), tuple(landmark_point[9]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[13]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[9]), tuple(landmark_point[13]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[17]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[13]), tuple(landmark_point[17]),
-                (255, 255, 255), 2)
-        cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[0]),
-                (0, 0, 0), 6)
-        cv.line(image, tuple(landmark_point[17]), tuple(landmark_point[0]),
-                (255, 255, 255), 2)
-
-    # キーポイント
-    for index, landmark in enumerate(landmark_point):
-        if index == 0:  # 手首1
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 1:  # 手首2
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 2:  # 親指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 3:  # 親指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 4:  # 親指：指先
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 5:  # 人差指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 6:  # 人差指：第2関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 7:  # 人差指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 8:  # 人差指：指先
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 9:  # 中指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 10:  # 中指：第2関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 11:  # 中指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 12:  # 中指：指先
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 13:  # 薬指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 14:  # 薬指：第2関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 15:  # 薬指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 16:  # 薬指：指先
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 17:  # 小指：付け根
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 18:  # 小指：第2関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 19:  # 小指：第1関節
-            cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 20:  # 小指：指先
-            cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
-                      -1)
-            cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
+    # Draw keypoints; make tip points larger
+    tip_indices = {4, 8, 12, 16, 20}
+    for idx, (x, y) in enumerate(points):
+        radius = 8 if idx in tip_indices else 5
+        cv.circle(image, (x, y), radius, (255, 255, 255), -1)
+        cv.circle(image, (x, y), radius, (0, 0, 0), 1)
 
     return image
 
 
 def draw_bounding_rect(use_brect, image, brect):
     if use_brect:
-        # 外接矩形
+        # Outer rectangle
         cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[3]),
                      (0, 0, 0), 1)
 

@@ -1,0 +1,31 @@
+[tool.poetry]
+name = "hand-gesture-recognition-mediapipe"
+version = "0.1.0"
+description = "Hand gesture recognition app using MediaPipe + PyTorch sequence classifier"
+authors = ["Your Name <you@example.com>"]
+package-mode = false
+license = "MIT"
+
+[tool.poetry.dependencies]
+# Restrict upper Python bound so native build tools (PyInstaller) are compatible.
+# PyInstaller currently requires Python <3.15, so pin project to <3.15 for reproducible builds.
+python = ">=3.12,<3.15"
+numpy = "^1.26"
+opencv-python = "^4.10.0"
+mediapipe = "^0.10"
+torch = "^2.2"
+
+[tool.poetry.group.dev.dependencies]
+pyinstaller = "^6.16"
+
+[build-system]
+requires = ["poetry-core>=1.6.0"]
+build-backend = "poetry.core.masonry.api"
+
+# Notes:
+# 1) After you add this file run `poetry install` and `poetry lock` locally to generate a reproducible lockfile (poetry.lock).
+# 2) You can then use `poetry export -f requirements.txt --output requirements.txt --with-hashes` to create a pinned requirements file for wheelhouse generation.
+
+[tool.poetry.scripts]
+# Adds a convenience `poetry run build` entrypoint that calls the Python build helper
+build = "tools.poetry_build:main"
